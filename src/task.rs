@@ -1,8 +1,7 @@
-use std::time::Duration;
-
 use chrono::{DateTime, Utc};
 use derivative::Derivative;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskRecord {
@@ -20,6 +19,16 @@ pub struct ScheduleTask {
 
 impl From<ScheduleTask> for TaskRecord {
     fn from(value: ScheduleTask) -> Self {
+        Self {
+            origin_name: value.origin_name.clone(),
+            origin_group: value.origin_group.clone(),
+            time: value.time.clone(),
+        }
+    }
+}
+
+impl From<TaskRecord> for ScheduleTask {
+    fn from(value: TaskRecord) -> Self {
         Self {
             origin_name: value.origin_name.clone(),
             origin_group: value.origin_group.clone(),

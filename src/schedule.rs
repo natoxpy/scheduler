@@ -1,10 +1,7 @@
-use std::io::{Read, Write};
-use std::path::Path;
-use std::{fs::File, time::Duration};
-
-use derivative::Derivative;
-
+use crate::storage::Storable;
 use crate::task::{ScheduleTask, Task, TaskRecord};
+use derivative::Derivative;
+use std::time::Duration;
 
 #[derive(Derivative)]
 #[derivative(Debug, Clone, Default)]
@@ -14,7 +11,7 @@ pub struct ScheduleConfiguration {
     #[derivative(Default(value = "180"))]
     pub break_frequency: u64,
 
-    #[derivative(Default(value = "8"))]
+    #[derivative(Default(value = "10"))]
     pub minibreaktime: u64,
     #[derivative(Default(value = "45"))]
     pub minibreak_frequency: u64,
@@ -27,7 +24,6 @@ pub struct ScheduleConfiguration {
 pub struct ExpectedRatioTasks(pub Vec<(Task, f32)>);
 
 impl ExpectedRatioTasks {
-    /// all tasks ratios should add up to `1`
     pub fn new(tasks: Vec<(Task, f32)>) -> Result<Self, ()> {
         let total_ratio = tasks.iter().fold(0.0, |acc, e| acc + e.1);
         let error_range = 0.01;
@@ -39,9 +35,9 @@ impl ExpectedRatioTasks {
         Ok(Self(tasks))
     }
 
-    pub fn write<P>(&self, path: P)
+    pub fn write<P>(&self, storage: &P)
     where
-        P: AsRef<Path>,
+        P: Storable<((String, String), f32)>,
     {
         let data: Vec<((String, String), f32)> = self
             .0
@@ -49,19 +45,15 @@ impl ExpectedRatioTasks {
             .map(|v| ((v.0.name.clone(), v.0.group.clone()), v.1))
             .collect();
 
-        let mut file = File::create(path).unwrap();
-        write!(file, "{}", serde_json::to_string_pretty(&data).unwrap()).unwrap();
+        storage.store(&data);
     }
 
-    pub fn read<P>(path: P, tasks: Vec<Task>) -> Self
+    pub fn read<P>(storage: &P, tasks: Vec<Task>) -> Self
     where
-        P: AsRef<Path>,
+        P: Storable<((String, String), f32)>,
     {
-        let mut file = File::open(path).unwrap();
-        let mut rawdata = String::new();
-        file.read_to_string(&mut rawdata).unwrap();
+        let data: Vec<((String, String), f32)> = storage.get();
 
-        let data: Vec<((String, String), f32)> = serde_json::from_str(rawdata.as_str()).unwrap();
         let mut output: Vec<(Task, f32)> = Vec::with_capacity(tasks.len());
         let mut used_tasks: Vec<Task> = Vec::with_capacity(tasks.len());
 
@@ -89,7 +81,7 @@ impl ExpectedRatioTasks {
             last.1 /= 2.0;
         }
 
-        Self(output)
+        Self::new(output).unwrap()
     }
 }
 
@@ -191,118 +183,105 @@ impl Scheduler {
         return cost;
     }
 
-    fn compute_breaks(&self, schedule: Vec<ScheduleTask>) -> Vec<ScheduleTask> {
+    fn compute_break(&self, virtual_history: &Vec<TaskRecord>) -> Option<ScheduleTask> {
+        let mut total_history = self.task_history.clone();
+        total_history.append(&mut virtual_history.clone());
+
         let mut since_last_minibreak = Duration::from_secs(0);
         let mut since_last_break = Duration::from_secs(0);
 
-        let mut breaked_schedule = vec![];
+        for record in total_history {
+            since_last_minibreak += record.time;
+            since_last_break += record.time;
 
-        for task in schedule {
-            if since_last_break >= Duration::from_secs(self.config.break_frequency * 60) {
+            if record.origin_group == "system/break" {
                 since_last_break = Duration::from_secs(0);
-                breaked_schedule.push(ScheduleTask {
-                    origin_name: String::from("Break"),
-                    origin_group: String::from("system/break"),
-                    time: Duration::from_secs(self.config.breaktime * 60),
-                })
-            } else if since_last_minibreak
-                >= Duration::from_secs(self.config.minibreak_frequency * 60)
-            {
                 since_last_minibreak = Duration::from_secs(0);
-                breaked_schedule.push(ScheduleTask {
-                    origin_name: String::from("Minibreak"),
-                    origin_group: String::from("system/minibreak"),
-                    time: Duration::from_secs(self.config.minibreaktime * 60),
-                })
             }
 
-            breaked_schedule.push(task.clone());
-
-            if task.origin_group == "system/minibreak" {
+            if record.origin_group == "system/minibreak" {
                 since_last_minibreak = Duration::from_secs(0);
-            } else {
-                since_last_minibreak += task.time.clone();
-            }
-
-            if task.origin_group == "system/break" {
-                since_last_break = Duration::from_secs(0);
-            } else {
-                since_last_break += task.time.clone();
             }
         }
 
-        breaked_schedule
+        println!("{:?}", since_last_break);
+
+        if since_last_break >= Duration::from_secs(self.config.break_frequency * 60) {
+            Some(ScheduleTask {
+                origin_name: String::from("Break"),
+                origin_group: String::from("system/break"),
+                time: Duration::from_secs(self.config.breaktime * 60),
+            })
+        } else if since_last_minibreak >= Duration::from_secs(self.config.minibreak_frequency * 60)
+        {
+            Some(ScheduleTask {
+                origin_name: String::from("Minibreak"),
+                origin_group: String::from("system/minibreak"),
+                time: Duration::from_secs(self.config.minibreaktime * 60),
+            })
+        } else {
+            None
+        }
     }
 
-    pub fn compute_task(&self, focus_time: Duration, limit: u32) -> Vec<ScheduleTask> {
-        let mut virtual_task_history = vec![];
-        let mut virtual_history_time = Duration::default();
+    pub fn compute_task(&self, virtual_history: &Vec<TaskRecord>) -> ScheduleTask {
+        let break_task = self.compute_break(&virtual_history);
+
+        if let Some(break_schedule) = break_task {
+            return break_schedule;
+        }
+
+        let mut lowest_task = TaskRecord::default();
+        let mut previous_cost = f32::MAX;
+
+        for (task, _) in self.tasks.0.iter() {
+            let future_task = TaskRecord {
+                origin_name: task.name.clone(),
+                origin_group: task.group.clone(),
+                time: task.config.time.clone(),
+            };
+
+            let mut future_factor = vec![future_task.clone()];
+            future_factor.append(&mut virtual_history.clone());
+
+            let history = self.compute_history_ratio_tasks(future_factor);
+            let cost = self.compute_cost(history);
+
+            if previous_cost > cost {
+                lowest_task = future_task;
+                previous_cost = cost;
+            }
+        }
+
+        ScheduleTask {
+            origin_name: lowest_task.origin_name.clone(),
+            origin_group: lowest_task.origin_group.clone(),
+            time: lowest_task.time,
+        }
+    }
+
+    pub fn compute_tasks(
+        &self,
+        virtual_history: &Vec<TaskRecord>,
+        limit: usize,
+    ) -> Vec<ScheduleTask> {
+        let mut future_schedule = Vec::with_capacity(limit);
 
         for _ in 0..limit {
-            if virtual_history_time > focus_time {
-                break;
-            }
+            let mut temp_virtual_history = Vec::with_capacity(virtual_history.len());
+            temp_virtual_history.append(&mut virtual_history.clone());
 
-            let mut lowest_task = TaskRecord::default();
-            let mut previous_cost = f32::MAX;
+            let mut future_history = future_schedule
+                .iter()
+                .cloned()
+                .map(|v| TaskRecord::from(v))
+                .collect();
 
-            for (task, _) in self.tasks.0.iter() {
-                let future_task = TaskRecord {
-                    origin_name: task.name.clone(),
-                    origin_group: task.group.clone(),
-                    time: task.config.time.clone(),
-                };
+            temp_virtual_history.append(&mut future_history);
 
-                let mut future_factor = vec![future_task.clone()];
-                future_factor.append(&mut virtual_task_history.clone());
-
-                let history = self.compute_history_ratio_tasks(future_factor);
-                let cost = self.compute_cost(history);
-
-                // println!(
-                //     "{:.3?} {:.3?} {}",
-                //     previous_cost, cost, future_task.origin_group
-                // );
-
-                if previous_cost > cost {
-                    lowest_task = future_task;
-                    previous_cost = cost;
-                }
-            }
-
-            if previous_cost == f32::MAX {
-                break;
-            }
-
-            virtual_history_time += lowest_task.time.clone();
-            // println!("{}", lowest_task.origin_group);
-            virtual_task_history.push(lowest_task);
-
-            // let history = self.compute_history_ratio_tasks(virtual_task_history.clone());
-
-            // for record in history.iter() {
-            //     println!("{} {}", record.0.0, record.1);
-            // }
-
-            // let cost = self.compute_cost(history);
-            // println!("{}\n", cost);
-            // println!("");
+            future_schedule.push(self.compute_task(&temp_virtual_history));
         }
 
-        self.compute_breaks(
-            virtual_task_history
-                .iter()
-                .map(|i| ScheduleTask {
-                    origin_name: i.origin_name.clone(),
-                    origin_group: i.origin_group.clone(),
-                    time: i.time,
-                })
-                .collect(),
-        )
+        future_schedule
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Schedule {
-    pub tasks: Vec<ScheduleTask>,
 }

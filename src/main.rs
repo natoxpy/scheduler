@@ -1,13 +1,11 @@
 extern crate scheduler;
 
 use scheduler::schedule::{ExpectedRatioTasks, ScheduleConfiguration, Scheduler};
+use scheduler::storage::{FileStorage, Storable};
 use scheduler::task::{ScheduleTask, Task, TaskRecord};
-use std::fs::File;
+use std::io::{self, Write};
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{
-    io::{self, Write},
-    thread,
-};
 
 fn clear_screen() {
     // Clear entire screen, move cursor to top-left
@@ -22,26 +20,16 @@ fn format_duration(d: Duration) -> String {
     format!("{:02}:{:02}", minutes, seconds)
 }
 
-fn write_history(scheduler: &Scheduler) {
-    let mut path = File::create("../history.json").unwrap();
-
-    write!(
-        path,
-        "{}",
-        serde_json::to_string_pretty(&scheduler.task_history).unwrap()
-    )
-    .unwrap();
-}
-
 fn main() {
-    let tasks: Vec<Task> = serde_json::from_str(include_str!("../../tasks.json")).unwrap();
-    let history: Vec<TaskRecord> =
-        serde_json::from_str(include_str!("../../history.json")).unwrap();
-    let ratioed_tasks = ExpectedRatioTasks::read("../task-ratio.json", tasks);
+    let storage = FileStorage::new("../tasks.json", "../history.json", "../task-ratio.json");
+
+    let tasks: Vec<Task> = storage.get();
+    let history: Vec<TaskRecord> = storage.get();
+    let ratioed_tasks = ExpectedRatioTasks::read(&storage, tasks);
 
     let mut scheduler = Scheduler::new(ratioed_tasks, history, ScheduleConfiguration::default());
 
-    let mut schedule_tasks = scheduler.compute_task(Duration::from_secs(60 * 60 * 6), 5);
+    let mut schedule_tasks = scheduler.compute_tasks(&vec![], 15);
 
     let origin_time = Instant::now();
     let mut current_task = schedule_tasks.remove(0);
@@ -53,9 +41,9 @@ fn main() {
         if current_task.time.as_secs() - since_last_start.elapsed().as_secs() == 0 {
             if current_task.origin_group != "system/transition" {
                 since_last_start = Instant::now();
-                scheduler.task_history.push(TaskRecord::from(current_task));
+                scheduler.feed_record(TaskRecord::from(current_task));
 
-                write_history(&scheduler);
+                storage.store(&scheduler.task_history);
 
                 current_task = ScheduleTask {
                     origin_name: String::from("Transition"),
@@ -64,14 +52,7 @@ fn main() {
                 };
             } else {
                 since_last_start = Instant::now();
-
                 current_task = schedule_tasks.remove(0);
-                let future_task = scheduler
-                    .compute_task(Duration::new(99999, 0), 1)
-                    .pop()
-                    .unwrap();
-
-                schedule_tasks.push(future_task)
             }
         }
 
