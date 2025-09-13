@@ -6,5 +6,14 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.41", features = ["serde"] }
 derivative = "2.2.0"
+poem = { version = "3.1.12", features = ["session"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
+tokio = { version = "1.47.1", features = ["full"] }
+sqlx = { version = "0.6.0", features = [
+    "sqlite",
+    "runtime-async-std-native-tls",
+] }
+async-trait = "0.1.89"
+uuid = { version = "1.18.0", features = ["v4"] }
+argon2 = "0.5.3"
